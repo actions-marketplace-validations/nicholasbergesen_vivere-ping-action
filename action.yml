@@ -1,0 +1,113 @@
+name: 'Vivere ping'
+description: 'Tell a Vivere monitor that a scheduled job ran, so you are alerted when one does not.'
+author: 'Nicholas Bergesen'
+
+branding:
+  icon: 'activity'
+  color: 'green'
+
+inputs:
+  url:
+    description: >
+      The monitor's ping URL, e.g. https://vivere.dev/p/<monitor-id>. Keep it in a repository
+      secret: anyone with the URL can mark your monitor as healthy.
+    required: true
+  status:
+    description: >
+      What happened. "success" (the default) marks the run good; "start" opens a run so the
+      next report records a duration; "fail" marks it failed; a number 0-255 reports an exit
+      code. The values GitHub's own job.status produces are accepted too, so you can pass
+      ${{ job.status }} directly: success stays success, failure and cancelled become fail.
+    required: false
+    default: 'success'
+  log:
+    description: >
+      Optional text to attach to the run, which appears beside the failure in the dashboard.
+      Vivere keeps the last 64 KB.
+    required: false
+    default: ''
+  timeout:
+    description: 'Seconds to allow for the whole call.'
+    required: false
+    default: '10'
+  retries:
+    description: 'Retries on a transient network failure.'
+    required: false
+    default: '3'
+  fail-on-error:
+    description: >
+      Whether a failed ping should fail the step. Off by default: a monitoring call is not
+      worth breaking a build over, and a ping that never arrives raises an alert anyway,
+      which is the outcome you wanted.
+    required: false
+    default: 'false'
+
+outputs:
+  pinged:
+    description: '"true" when the monitor accepted the ping.'
+    value: ${{ steps.ping.outputs.pinged }}
+
+runs:
+  using: composite
+  steps:
+    - id: ping
+      shell: bash
+      env:
+        VIVERE_URL: ${{ inputs.url }}
+        VIVERE_STATUS: ${{ inputs.status }}
+        VIVERE_LOG: ${{ inputs.log }}
+        VIVERE_TIMEOUT: ${{ inputs.timeout }}
+        VIVERE_RETRIES: ${{ inputs.retries }}
+        VIVERE_FAIL: ${{ inputs.fail-on-error }}
+      run: |
+        set -uo pipefail
+
+        base="${VIVERE_URL%/}"
+        if [ -z "$base" ]; then
+          echo "::error::url is required"
+          exit 1
+        fi
+        case "$base" in
+          https://*|http://*) ;;
+          *) echo "::error::url must start with https:// (got ${base%%:*}:...)"; exit 1 ;;
+        esac
+
+        # Map the status onto a ping path. job.status values are accepted so that
+        # `status: ${{ job.status }}` on an always() step does the obvious thing.
+        case "$VIVERE_STATUS" in
+          success|"")        path="" ;;
+          start)             path="/start" ;;
+          fail|failure)      path="/fail" ;;
+          cancelled|canceled) path="/fail" ;;
+          skipped)           echo "job was skipped; not pinging"; echo "pinged=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          *[!0-9]*)          echo "::error::status must be success, start, fail or a number 0-255 (got '$VIVERE_STATUS')"; exit 1 ;;
+          *)
+            if [ "$VIVERE_STATUS" -gt 255 ]; then
+              echo "::error::exit code must be 0-255 (got '$VIVERE_STATUS')"
+              exit 1
+            fi
+            path="/$VIVERE_STATUS"
+            ;;
+        esac
+
+        # The URL is a secret, so nothing below ever echoes it.
+        args=(--silent --show-error --fail --location
+              --max-time "$VIVERE_TIMEOUT" --retry "$VIVERE_RETRIES" --retry-connrefused
+              --output /dev/null --user-agent "vivere-ping-action")
+        if [ -n "$VIVERE_LOG" ]; then
+          args+=(--request POST --data-binary "$VIVERE_LOG" --header "Content-Type: text/plain")
+        fi
+
+        if curl "${args[@]}" "${base}${path}"; then
+          echo "pinged ${VIVERE_STATUS}"
+          echo "pinged=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "pinged=false" >> "$GITHUB_OUTPUT"
+        if [ "$VIVERE_FAIL" = "true" ]; then
+          echo "::error::the ping did not reach the monitor"
+          exit 1
+        fi
+        echo "::warning::the ping did not reach the monitor; the missed check-in will raise an alert instead"
+        exit 0

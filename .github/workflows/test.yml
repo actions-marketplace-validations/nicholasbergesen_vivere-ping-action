@@ -1,0 +1,129 @@
+# Exercises the action against a local server rather than against vivere.dev, so the tests
+# need no secret, cost nothing and cannot be broken by someone else's outage.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start a server that records what it is sent
+        run: |
+          cat > server.py <<'PY'
+          import http.server, json, threading
+          hits = []
+          class H(http.server.BaseHTTPRequestHandler):
+              def _record(self):
+                  n = int(self.headers.get("Content-Length") or 0)
+                  body = self.rfile.read(n).decode() if n else ""
+                  hits.append({"method": self.command, "path": self.path, "body": body})
+                  with open("hits.json", "w") as f:
+                      json.dump(hits, f)
+                  code = 500 if self.path.endswith("/boom") else 200
+                  self.send_response(code)
+                  self.end_headers()
+                  self.wfile.write(b"OK")
+              do_GET = do_POST = do_PUT = _record
+              def log_message(self, *a): pass
+          http.server.HTTPServer(("127.0.0.1", 8099), H).serve_forever()
+          PY
+          python3 server.py &
+          for i in $(seq 1 20); do curl -fsS -o /dev/null http://127.0.0.1:8099/up && break; sleep 0.2; done
+
+      - name: success
+        uses: ./
+        with:
+          url: http://127.0.0.1:8099/p/test
+
+      - name: start
+        uses: ./
+        with:
+          url: http://127.0.0.1:8099/p/test
+          status: start
+
+      - name: an exit code
+        uses: ./
+        with:
+          url: http://127.0.0.1:8099/p/test
+          status: '3'
+
+      - name: a job.status value
+        uses: ./
+        with:
+          url: http://127.0.0.1:8099/p/test
+          status: failure
+
+      - name: a log body
+        uses: ./
+        with:
+          url: http://127.0.0.1:8099/p/test
+          log: 'exported 1234 rows'
+
+      - name: a skipped job pings nothing
+        id: skipped
+        uses: ./
+        with:
+          url: http://127.0.0.1:8099/p/test
+          status: skipped
+
+      - name: a server error does not fail the build by default
+        id: soft
+        uses: ./
+        with:
+          url: http://127.0.0.1:8099/p/boom
+
+      - name: check what the server received
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          hits = json.load(open("hits.json"))
+          paths = [h["path"] for h in hits if h["path"].startswith("/p/test")]
+          want = ["/p/test", "/p/test/start", "/p/test/3", "/p/test/fail", "/p/test"]
+          assert paths == want, f"got {paths}\nwant {want}"
+          body = [h["body"] for h in hits if h["body"]]
+          assert body == ["exported 1234 rows"], body
+          method = [h["method"] for h in hits if h["body"]]
+          assert method == ["POST"], method
+          print("all", len(hits), "requests were as expected")
+          PY
+
+      - name: outputs
+        run: |
+          test "${{ steps.skipped.outputs.pinged }}" = "false" || { echo "skipped should not ping"; exit 1; }
+          test "${{ steps.soft.outputs.pinged }}" = "false" || { echo "a 500 is not a successful ping"; exit 1; }
+
+      - name: a bad status is rejected
+        id: bad
+        continue-on-error: true
+        uses: ./
+        with:
+          url: http://127.0.0.1:8099/p/test
+          status: banana
+
+      - name: a non-http url is rejected
+        id: scheme
+        continue-on-error: true
+        uses: ./
+        with:
+          url: file:///etc/passwd
+
+      - name: fail-on-error really fails
+        id: hard
+        continue-on-error: true
+        uses: ./
+        with:
+          url: http://127.0.0.1:8099/p/boom
+          fail-on-error: 'true'
+
+      - name: the three above must all have failed
+        run: |
+          for s in "${{ steps.bad.outcome }}" "${{ steps.scheme.outcome }}" "${{ steps.hard.outcome }}"; do
+            test "$s" = "failure" || { echo "expected a failure, got $s"; exit 1; }
+          done
