@@ -16,8 +16,9 @@ inputs:
     description: >
       What happened. "success" (the default) marks the run good; "start" opens a run so the
       next report records a duration; "fail" marks it failed; a number 0-255 reports an exit
-      code. The values GitHub's own job.status produces are accepted too, so you can pass
-      ${{ job.status }} directly: success stays success, failure and cancelled become fail.
+      code. The values GitHub's own job.status context produces are accepted too, so that
+      expression can be passed straight in on an always() step: success stays success,
+      failure and cancelled become fail, and skipped pings nothing.
     required: false
     default: 'success'
   log:
@@ -72,8 +73,8 @@ runs:
           *) echo "::error::url must start with https:// (got ${base%%:*}:...)"; exit 1 ;;
         esac
 
-        # Map the status onto a ping path. job.status values are accepted so that
-        # `status: ${{ job.status }}` on an always() step does the obvious thing.
+        # Map the status onto a ping path. GitHub's own job.status values are accepted
+        # so that passing that context on an always() step does the obvious thing.
         case "$VIVERE_STATUS" in
           success|"")        path="" ;;
           start)             path="/start" ;;
